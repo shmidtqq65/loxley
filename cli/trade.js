@@ -5,7 +5,7 @@
    Uniswap v4 through the universal router behind the pons hook, and every send is simulated first. */
 const fs = require('fs');
 const path = require('path');
-const { createPublicClient, createWalletClient, custom, defineChain, parseAbi, encodeAbiParameters, encodePacked, keccak256, formatEther, parseEther, decodeEventLog, maxUint160, maxUint48, maxUint256, getAddress, isAddressEqual } = require('./deps');
+const { createPublicClient, createWalletClient, custom, defineChain, parseAbi, encodeAbiParameters, encodeFunctionData, encodePacked, keccak256, formatEther, parseEther, decodeFunctionResult, decodeEventLog, maxUint160, maxUint48, maxUint256, getAddress, isAddressEqual } = require('./deps');
 const { home } = require('./wallet');
 
 const BPS = 10000n;
@@ -145,16 +145,34 @@ function makeTrader(ctx, wallet) {
     if (!r || !r.exists) return null;
     return Object.assign({}, r, { token: getAddress(token), phaseText: PHASE[Number(r.phase)] || ('phase ' + r.phase), pairIsEth: r.pairToken === ZERO || isAddressEqual(r.pairToken, ZERO) });
   }
-  /* the curve in one breath: reserves, fees, flags, and the opening tax for the wallet that would buy */
+  /* the curve in one breath: reserves, fees, flags, and the opening tax for the wallet that would buy.
+     one multicall3 request instead of 13 rpc round-trips. falls back to one call each when the
+     multicall contract is not on the chain. */
   async function curveState(curve, who) {
     const c = getAddress(curve);
-    const [res, real, sellable, reserved, thr, ready, grad, fee, ctax, native, pair, launchedAt, snipe] = await Promise.all([
-      read(c, ABI.curve, 'getReserves'), read(c, ABI.curve, 'realQuoteReserve'), read(c, ABI.curve, 'sellableTokens').catch(() => null), read(c, ABI.curve, 'reservedTokens').catch(() => 0n),
-      read(c, ABI.curve, 'graduationThreshold'), read(c, ABI.curve, 'readyToGraduate'), read(c, ABI.curve, 'graduated'), read(c, ABI.curve, 'feeBps'), read(c, ABI.curve, 'creatorTaxBps'),
-      read(c, ABI.curve, 'isNativeQuote').catch(() => true), read(c, ABI.curve, 'pairToken').catch(() => ZERO), read(c, ABI.curve, 'launchedAt').catch(() => 0n),
-      read(c, ABI.curve, 'currentSnipeTaxBps', [who ? getAddress(who) : '0x0000000000000000000000000000000000000001']).catch(() => null)
-    ]);
-    return { curve: c, quoteReserve: res[0], tokenReserve: res[1], real, phantom: res[0] - real, sellableTokens: sellable, reservedTokens: reserved, threshold: thr, ready, graduated: grad, feeBps: fee, creatorTaxBps: ctax, isNativeQuote: native, pairToken: pair, launchedAt: Number(launchedAt) * 1000, openingTaxBps: snipe == null ? null : Number(snipe), fill: thr > 0n ? Number(real * 10000n / thr) / 10000 : null, price: res[1] > 0n ? Number(res[0]) / Number(res[1]) : null };
+    const whoAddr = who ? getAddress(who) : '0x0000000000000000000000000000000000000001';
+    const pad32 = a => '0x' + String(a).replace(/^0x/, '').toLowerCase().padStart(64, '0');
+    const calls = [
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'getReserves', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'realQuoteReserve', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'sellableTokens', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'reservedTokens', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'graduationThreshold', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'readyToGraduate', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'graduated', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'feeBps', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'creatorTaxBps', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'isNativeQuote', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'pairToken', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'launchedAt', args: [] }) },
+      { to: c, data: encodeFunctionData({ abi: ABI.curve, functionName: 'currentSnipeTaxBps', args: [whoAddr] }) },
+    ];
+    const r = await chain.multicall(calls);
+    const d = (fn, i) => { try { return decodeFunctionResult({ abi: ABI.curve, functionName: fn, data: r[i] }); } catch (e) { return null; } };
+    const res = d('getReserves', 0), real = d('realQuoteReserve', 1), sellable = d('sellableTokens', 2), reserved = d('reservedTokens', 3);
+    const thr = d('graduationThreshold', 4), ready = d('readyToGraduate', 5), grad = d('graduated', 6), fee = d('feeBps', 7), ctax = d('creatorTaxBps', 8);
+    const native = d('isNativeQuote', 9), pair = d('pairToken', 10), launchedAt = d('launchedAt', 11), snipe = d('currentSnipeTaxBps', 12);
+    return { curve: c, quoteReserve: res ? res[0] : null, tokenReserve: res ? res[1] : null, real: real || 0n, phantom: res && real ? res[0] - real : null, sellableTokens: sellable, reservedTokens: reserved || 0n, threshold: thr, ready: !!ready, graduated: !!grad, feeBps: fee, creatorTaxBps: ctax, isNativeQuote: native == null ? true : !!native, pairToken: pair || ZERO, launchedAt: launchedAt ? Number(launchedAt) * 1000 : 0, openingTaxBps: snipe == null ? null : Number(snipe), fill: thr && thr > 0n ? Number((real || 0n) * 10000n / thr) / 10000 : null, price: res && res[1] > 0n ? Number(res[0]) / Number(res[1]) : null };
   }
   const balance = who => pub.getBalance({ address: getAddress(who || account.address) });
   const tokenBalance = (token, who) => read(getAddress(token), ABI.erc20, 'balanceOf', [getAddress(who || account.address)]);

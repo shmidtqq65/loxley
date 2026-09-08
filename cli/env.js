@@ -58,6 +58,7 @@ const DEFAULTS = {
   RPC_SPACING_MS: '60',
   RPC_LOGS_SPACING_MS: '400',
   LOGS_CHUNK: '1000',
+  BUYERS_WINDOW_BLOCKS: '2000',
   HTTP_TIMEOUT_MS: '9000',
   HTTP_USER_AGENT: '',
   /* the sniper's rules, paper and live alike */
