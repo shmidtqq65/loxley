@@ -232,9 +232,12 @@ function makeChain(env, log) {
     return { quote, tokens, share: supply ? tokens / supply * 100 : null, n, quoteWei: quoteWei.toString() };
   }
   /* buyers on the curve since the launch block: distinct wallets, how many paid the opening tax, the block-0 bundle
-     (tokens taken in the launch block and the next by wallets other than the deployer), the top-5 net holders */
+     (tokens taken in the launch block and the next by wallets other than the deployer), the top-5 net holders.
+     the scan is capped to the last BUYERS_WINDOW_BLOCKS blocks so a popular launch with thousands of trades
+     doesn't fetch the entire history on every follow-up. */
   async function curveBuyers(launch, toBlock, supply) {
-    const logs = await getLogs(launch.curve, [[T.BUY, T.SELL]], launch.bn, toBlock).catch(() => []);
+    const fromBlock = Math.max(launch.bn, toBlock - env.num('BUYERS_WINDOW_BLOCKS'));
+    const logs = await getLogs(launch.curve, [[T.BUY, T.SELL]], fromBlock, toBlock).catch(() => []);
     const buyers = {}, sellers = {}, net = {}; let taxed = 0, buys = 0, sells = 0, quoteIn = 0, quoteOut = 0, bundleTokens = 0, bundleWallets = {}, devSells = 0, devTokensOut = 0;
     logs.forEach(lg => {
       const e = parseFactoryLog(lg); if (!e) return;
